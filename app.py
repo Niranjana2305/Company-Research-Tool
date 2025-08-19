@@ -14,7 +14,6 @@ class State(rx.State):
     company: Optional[Dict[str, Any]] = rx.field(default=None)
     employees: List[Dict[str, Any]] = rx.field(default_factory=list)
 
-    # --- Actions ---
     def search(self):
         name = (self.company_name or "").strip()
         if not name:
@@ -72,8 +71,6 @@ class State(rx.State):
         self.employees = []
         self.is_loading = False
 
-
-# --- UI Components ---
 def company_card() -> rx.Component:
     return rx.vstack(
         rx.heading("Company Details", size="5", color="blue.600"),
@@ -120,7 +117,6 @@ def employee_list() -> rx.Component:
         )
     )
 
-# --- Main Page ---
 @rx.page(route="/", title="Company Research Tool")
 def index() -> rx.Component:
     return rx.center(
@@ -148,12 +144,12 @@ def index() -> rx.Component:
         )
     )
 
-# --- App Setup ---
 app = rx.App(State)
 app.add_page(index)
 
 if __name__ == "__main__":
     app.run()
+
 
 
 
