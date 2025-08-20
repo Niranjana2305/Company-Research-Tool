@@ -1,154 +1,237 @@
-# app.py
-import reflex as rx
-from typing import Dict, Any, List, Optional
-from backend import get_company_cached_or_fetch, upsert_company_and_employees
+import json
+import re
+import os
+from typing import Any, Dict, List, Optional
+from dotenv import load_dotenv
+from sqlmodel import Session, select, create_engine
+from sqlalchemy import func
+from models import Company, Employee
+from sqlmodel import SQLModel
+import google.generativeai as genai
+import streamlit as st
 
-class State(rx.State):
-    company_name: str = ""
-    industry_input: str = ""
-    employee_size_input: str = ""
-    domain_input: str = ""
-    status: str = ""
-    is_loading: bool = False
+load_dotenv()
+DB_FILE = os.getenv("DB_FILE", "company_research.db")
+DATABASE_URL = f"sqlite:///{DB_FILE}"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", None)
 
-    company: Optional[Dict[str, Any]] = rx.field(default=None)
-    employees: List[Dict[str, Any]] = rx.field(default_factory=list)
+engine = create_engine(DATABASE_URL, echo=False)
+SQLModel.metadata.create_all(engine)
 
-    def search(self):
-        name = (self.company_name or "").strip()
-        if not name:
-            self.status = "Please enter a company name."
-            self.company = None
-            self.employees = []
-            return
-        self.is_loading = True
-        self.status = "Searching..."
-        yield
+client = None
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    client = genai.GenerativeModel("gemini-2.0-flash-exp")
 
-        result = get_company_cached_or_fetch(name)
-        source = result.get("source")
-        if source == "db":
-            self.status = "Loaded from database (cached)."
-        elif source == "gemini":
-            self.status = "Fetched from Gemini AI & cached."
-        elif source == "error":
-            self.status = f"Error: {result.get('message')}"
+def normalize_name(s: str) -> str:
+    return " ".join(s.split()).strip().casefold() if s else ""
+
+def has_name_normalized_field() -> bool:
+    return hasattr(Company, "name_normalized")
+
+def get_company_by_name(session: Session, name: str) -> Optional[Company]:
+    if not name:
+        return None
+    stmt = select(Company).where(Company.name == name)
+    res = session.exec(stmt).first()
+    if res:
+        return res
+    if has_name_normalized_field():
+        norm = normalize_name(name)
+        stmt = select(Company).where(Company.name_normalized == norm)
+        res = session.exec(stmt).first()
+        if res:
+            return res
+    stmt = select(Company).where(func.lower(Company.name) == name.lower())
+    return session.exec(stmt).first()
+
+def safe_json_parse(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(text[start:end+1])
+            except Exception:
+                return None
+    return None
+
+def parse_employee_list_from_text(text: str) -> List[Dict[str, Any]]:
+    employees: List[Dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = re.split(r"\s*\|\s*|\s*-\s*|\s*,\s*", line)
+        emp = {"full_name": None, "title": None, "department": None, "seniority": None, "profile_url": None}
+        if len(parts) >= 1:
+            emp["full_name"] = parts[0].strip()
+        if len(parts) >= 2:
+            emp["title"] = parts[1].strip()
+        if len(parts) >= 3:
+            emp["department"] = parts[2].strip()
+        if len(parts) >= 4:
+            emp["seniority"] = parts[3].strip()
+        if len(parts) >= 5:
+            emp["profile_url"] = parts[4].strip()
+        if emp["full_name"]:
+            employees.append(emp)
+    return employees
+
+GEMINI_PROMPT_COMPANY = """
+You are a factual assistant. Using Google Search grounding, return EXACTLY a JSON object:
+{
+  "company": {
+    "name": "string",
+    "industry": "string|null",
+    "employee_size": "integer|null",
+    "domain": "string|null"
+  },
+  "employees": [
+    {"full_name":"string","title":"string|null","department":"string|null","seniority":"string|null","profile_url":"string|null"}
+  ]
+}
+Keep employees <=10. Only publicly listed.
+"""
+
+def fetch_from_gemini(company_query: str) -> Dict[str, Any]:
+    if not client:
+        raise RuntimeError("GEMINI_API_KEY not set; can't call Gemini.")
+    resp = client.generate_content(GEMINI_PROMPT_COMPANY + f'\nQuery: "{company_query}"')
+    text = getattr(resp, "text", str(resp))
+    parsed = safe_json_parse(text)
+    if parsed:
+        return parsed
+    return {"company": {"name": company_query, "industry": None, "employee_size": None, "domain": None},
+            "employees": parse_employee_list_from_text(text)}
+
+def upsert_company_and_employees(data: Dict[str, Any]) -> Company:
+    company_data = data.get("company") or {}
+    employees = data.get("employees") or []
+    company_name = company_data.get("name") or "Unknown"
+    industry = company_data.get("industry")
+    employee_size = company_data.get("employee_size")
+    domain = company_data.get("domain")
+
+    with Session(engine) as session:
+        existing = get_company_by_name(session, company_name)
+        if existing:
+            if industry: 
+                existing.industry = industry
+            if employee_size is not None:
+                try: 
+                    existing.employee_size = int(employee_size)
+                except Exception:
+                    pass
+            if domain: 
+                existing.domain = domain
+            if has_name_normalized_field(): 
+                existing.name_normalized = normalize_name(company_name)
+                session.add(existing)
+                session.commit()
+                session.refresh(existing)
+            company_obj = existing
         else:
-            self.status = result.get("message", "No data found.")
-        self.company = result.get("company")
-        self.employees = result.get("employees", [])
-        self.is_loading = False
-
-    def add_manual_entry(self):
-        name = (self.company_name or "").strip()
-        if not name:
-            self.status = "Please enter a company name to add manually."
-            return
-        manual_data = {
-            "company": {
-                "name": name,
-                "industry": self.industry_input.strip() or None,
-                "employee_size": int(self.employee_size_input) if self.employee_size_input.strip().isdigit() else None,
-                "domain": self.domain_input.strip() or None,
-            },
-            "employees": []
-        }
-        try:
-            stored = upsert_company_and_employees(manual_data)
-            self.status = "Company added manually to database."
-            self.company = stored.get("company")
-            self.employees = stored.get("employees", [])
-        except Exception as e:
-            self.status = f"Error adding company: {str(e)}"
-
-    def clear(self):
-        self.company_name = ""
-        self.industry_input = ""
-        self.employee_size_input = ""
-        self.domain_input = ""
-        self.status = ""
-        self.company = None
-        self.employees = []
-        self.is_loading = False
-
-def company_card() -> rx.Component:
-    return rx.vstack(
-        rx.heading("Company Details", size="5", color="blue.600"),
-        rx.box(
-            rx.vstack(
-                rx.hstack(rx.text("Name:", font_weight="600"), rx.text(State.company["name"])),
-                rx.hstack(rx.text("Industry:", font_weight="600"),
-                         rx.cond(State.company["industry"], rx.text(State.company["industry"]), rx.text("Not specified"))),
-                rx.hstack(rx.text("Employee Size:", font_weight="600"),
-                         rx.cond(State.company["employee_size"], rx.text(State.company["employee_size"]), rx.text("Not specified"))),
-                rx.hstack(rx.text("Domain:", font_weight="600"),
-                         rx.cond(State.company["domain"], rx.text(State.company["domain"]), rx.text("Not specified"))),
-                spacing="2"
-            ),
-            padding="4", border="1px solid", border_color="gray.200", border_radius="lg", bg="gray.50"
-        ),
-        spacing="3"
-    )
-
-def employee_list() -> rx.Component:
-    return rx.vstack(
-        rx.heading("Employees", size="5", color="blue.600"),
-        rx.cond(
-            rx.len(State.employees) == 0,
-            rx.text("No employees found.", color="gray.500", font_style="italic"),
-            rx.vstack(
-                rx.foreach(
-                    State.employees,
-                    lambda emp, i: rx.box(
-                        rx.vstack(
-                            rx.text(emp["full_name"], font_weight="600"),
-                            rx.text(f"{emp.get('title', 'N/A')} — {emp.get('department', 'N/A')} — {emp.get('seniority', 'N/A')}"),
-                            rx.cond(emp.get("profile_url"),
-                                    rx.link("View Profile →", href=emp["profile_url"], is_external=True),
-                                    rx.text("No profile URL", color="gray.400")),
-                            spacing="2"
-                        ),
-                        padding="4", border="1px solid", border_color="gray.200",
-                        border_radius="lg", bg="white", _hover={"bg": "gray.50"}
-                    )
-                ),
-                spacing="3"
+            company_obj = Company(
+                name=company_name,
+                **({"name_normalized": normalize_name(company_name)} if has_name_normalized_field() else {}),
+                industry=industry or None,
+                employee_size=int(employee_size) if isinstance(employee_size, (int, str)) and str(employee_size).isdigit() else None,
+                domain=domain or None
             )
-        )
-    )
+            session.add(company_obj)
+            session.commit()
+            session.refresh(company_obj)
 
-@rx.page(route="/", title="Company Research Tool")
-def index() -> rx.Component:
-    return rx.center(
-        rx.vstack(
-            rx.heading("🏢 Company Research Tool", size="9", color="blue.600", text_align="center"),
-            rx.input(value=State.company_name, placeholder="Enter company name", on_change=State.set_company_name),
-            rx.hstack(
-                rx.button(rx.cond(State.is_loading, rx.text("Searching..."), rx.text("🔍 Search")),
-                          on_click=State.search, disabled=State.is_loading),
-                rx.button("🗑️ Clear", on_click=State.clear),
-                spacing="3"
-            ),
-            rx.details(
-                rx.summary("➕ Add Manual Entry"),
-                rx.vstack(
-                    rx.input(value=State.industry_input, placeholder="Industry", on_change=State.set_industry_input),
-                    rx.input(value=State.employee_size_input, placeholder="Employee count", on_change=State.set_employee_size_input),
-                    rx.input(value=State.domain_input, placeholder="Website domain", on_change=State.set_domain_input),
-                    rx.button("💾 Add to Database", on_click=State.add_manual_entry)
+        seen = set()
+        for e in employees:
+            full_name = (e.get("full_name") or "").strip()
+            if not full_name:
+                continue
+            key = normalize_name(full_name)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            stmt = select(Employee).where((Employee.company_id == company_obj.id) & (func.lower(Employee.full_name) == full_name.lower()))
+            existing_emp = session.exec(stmt).first()
+            if existing_emp:
+                if e.get("title") and (existing_emp.title in (None, "Not found")): 
+                    existing_emp.title = e.get("title")
+                if e.get("department") and (existing_emp.department in (None, "Not found")): 
+                    existing_emp.department = e.get("department")
+                if e.get("seniority") and (existing_emp.seniority in (None, "Not found")): 
+                    existing_emp.seniority = e.get("seniority")
+                if e.get("profile_url") and (existing_emp.profile_url in (None, "Not found")): 
+                    existing_emp.profile_url = e.get("profile_url")
+                session.add(existing_emp)
+            else:
+                new_emp = Employee(
+                    full_name=full_name,
+                    title=e.get("title") or "Not found",
+                    department=e.get("department") or "Not found",
+                    seniority=e.get("seniority") or "Not found",
+                    profile_url=e.get("profile_url") or "Not found",
+                    company_id=company_obj.id
                 )
-            ),
-            rx.cond(State.status, rx.text(State.status, color="blue.600")),
-            rx.cond(State.company, rx.vstack(company_card(), employee_list())),
-            spacing="4", width="100%", max_width="4xl", padding="6"
-        )
-    )
+                session.add(new_emp)
+        session.commit()
+        session.refresh(company_obj)
+        return company_obj
 
-app = rx.App(State)
-app.add_page(index)
+# Streamlit App 
+st.set_page_config(page_title="Company Research", layout="wide")
+st.title("🔎 Company Research Tool")
 
-if __name__ == "__main__":
-    app.run()
+with st.form("company_form"):
+    q = st.text_input("Enter company name", "")
+    industry_in = st.text_input("Industry (optional)", "")
+    emp_in = st.text_input("Employee Size (optional)", "")
+    domain_in = st.text_input("Domain/Website (optional)", "")
+    submitted = st.form_submit_button("Search")
+
+if submitted and q:
+    user_inputs = {"industry": industry_in, "employee_size": emp_in, "domain": domain_in}
+    with Session(engine) as session:
+        company = get_company_by_name(session, q)
+
+    if company:
+        st.success("✅ Found in local database (Gemini NOT called)")
+    else:
+        if not client:
+            st.error("❌ Not in DB and GEMINI_API_KEY not configured")
+            st.stop()
+        st.info("🌐 Fetching from Gemini...")
+        try:
+            data = fetch_from_gemini(q)
+            company = upsert_company_and_employees(data)
+        except Exception as e:
+            st.error(f"Error fetching/saving: {e}")
+            st.stop()
+
+    st.subheader("🏢 Company Information")
+    st.write(f"**Name:** {company.name}")
+    st.write(f"**Industry:** {company.industry or 'Not found'}")
+    st.write(f"**Employee size:** {company.employee_size or 'Not found'}")
+    st.write(f"**Domain:** {company.domain or 'Not found'}")
+
+    with Session(engine) as session:
+        employees = session.exec(select(Employee).where(Employee.company_id == company.id)).all()
+    st.subheader("👥 Employees")
+    if employees:
+        st.table([{
+            "Name": e.full_name,
+            "Title": e.title,
+            "Department": e.department,
+            "Seniority": e.seniority,
+            "Profile": e.profile_url
+        } for e in employees])
+    else:
+        st.info("No employees stored for this company.")
 
 
 
