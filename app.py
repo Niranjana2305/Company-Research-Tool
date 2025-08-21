@@ -1,28 +1,24 @@
+import os
 import json
 import re
-import os
 from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
-from sqlmodel import Session, select, create_engine
+from sqlmodel import Session, select, create_engine, SQLModel
 from sqlalchemy import func
 from models import Company, Employee
-from sqlmodel import SQLModel
 import google.generativeai as genai
 import streamlit as st
 
 load_dotenv()
-DB_FILE = os.getenv("DB_FILE", "company_research.db")
-DATABASE_URL = f"sqlite:///{DB_FILE}"
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", None)
-
+DATABASE_URL = os.getenv("DATABASE_URL")
 engine = create_engine(DATABASE_URL, echo=False)
 SQLModel.metadata.create_all(engine)
 
-client = None
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
     client = genai.GenerativeModel("gemini-2.0-flash-exp")
-
+        
 def normalize_name(s: str) -> str:
     return " ".join(s.split()).strip().casefold() if s else ""
 
@@ -32,18 +28,18 @@ def has_name_normalized_field() -> bool:
 def get_company_by_name(session: Session, name: str) -> Optional[Company]:
     if not name:
         return None
-    stmt = select(Company).where(Company.name == name)
-    res = session.exec(stmt).first()
+    # Exact match
+    res = session.exec(select(Company).where(Company.name == name)).first()
     if res:
         return res
+    # Normalized 
     if has_name_normalized_field():
         norm = normalize_name(name)
-        stmt = select(Company).where(Company.name_normalized == norm)
-        res = session.exec(stmt).first()
+        res = session.exec(select(Company).where(Company.name_normalized == norm)).first()
         if res:
             return res
-    stmt = select(Company).where(func.lower(Company.name) == name.lower())
-    return session.exec(stmt).first()
+    # Case-insensitive fallback
+    return session.exec(select(Company).where(func.lower(Company.name) == name.lower())).first()
 
 def safe_json_parse(text: str) -> Optional[Dict[str, Any]]:
     if not text:
@@ -51,8 +47,7 @@ def safe_json_parse(text: str) -> Optional[Dict[str, Any]]:
     try:
         return json.loads(text)
     except Exception:
-        start = text.find("{")
-        end = text.rfind("}")
+        start, end = text.find("{"), text.rfind("}")
         if start != -1 and end != -1 and end > start:
             try:
                 return json.loads(text[start:end+1])
@@ -74,7 +69,7 @@ def parse_employee_list_from_text(text: str) -> List[Dict[str, Any]]:
             emp["title"] = parts[1].strip()
         if len(parts) >= 3:
             emp["department"] = parts[2].strip()
-        if len(parts) >= 4:
+        if len(parts) >= 4: 
             emp["seniority"] = parts[3].strip()
         if len(parts) >= 5:
             emp["profile_url"] = parts[4].strip()
@@ -95,58 +90,54 @@ You are a factual assistant. Using Google Search grounding, return EXACTLY a JSO
     {"full_name":"string","title":"string|null","department":"string|null","seniority":"string|null","profile_url":"string|null"}
   ]
 }
-Keep employees <=10. Only publicly listed.
+Keep employees <=10. Only publicly listed. Industry should be seperated by commas if multiple.
 """
-
 def fetch_from_gemini(company_query: str) -> Dict[str, Any]:
     if not client:
-        raise RuntimeError("GEMINI_API_KEY not set; can't call Gemini.")
+        raise RuntimeError("GEMINI_API_KEY not set so can't call Gemini.")
     resp = client.generate_content(GEMINI_PROMPT_COMPANY + f'\nQuery: "{company_query}"')
     text = getattr(resp, "text", str(resp))
     parsed = safe_json_parse(text)
     if parsed:
         return parsed
-    return {"company": {"name": company_query, "industry": None, "employee_size": None, "domain": None},
-            "employees": parse_employee_list_from_text(text)}
-
+    return {
+        "company": {"name": company_query, "industry": None, "employee_size": None, "domain": None},
+        "employees": parse_employee_list_from_text(text),
+    }
 def upsert_company_and_employees(data: Dict[str, Any]) -> Company:
     company_data = data.get("company") or {}
     employees = data.get("employees") or []
     company_name = company_data.get("name") or "Unknown"
-    industry = company_data.get("industry")
-    employee_size = company_data.get("employee_size")
-    domain = company_data.get("domain")
-
     with Session(engine) as session:
         existing = get_company_by_name(session, company_name)
         if existing:
-            if industry: 
-                existing.industry = industry
-            if employee_size is not None:
+            # Update only missing fields
+            if company_data.get("industry"): 
+                existing.industry = company_data["industry"]
+            if company_data.get("employee_size") not in (None, ""):
                 try: 
-                    existing.employee_size = int(employee_size)
+                    existing.employee_size = int(company_data["employee_size"])
                 except Exception:
                     pass
-            if domain: 
-                existing.domain = domain
+            if company_data.get("domain"): 
+                existing.domain = company_data["domain"]
             if has_name_normalized_field(): 
                 existing.name_normalized = normalize_name(company_name)
-                session.add(existing)
-                session.commit()
-                session.refresh(existing)
+            session.add(existing)
+            session.commit()
+            session.refresh(existing)
             company_obj = existing
         else:
             company_obj = Company(
                 name=company_name,
                 **({"name_normalized": normalize_name(company_name)} if has_name_normalized_field() else {}),
-                industry=industry or None,
-                employee_size=int(employee_size) if isinstance(employee_size, (int, str)) and str(employee_size).isdigit() else None,
-                domain=domain or None
+                industry=company_data.get("industry"),
+                employee_size=int(company_data["employee_size"]) if str(company_data.get("employee_size") or "").isdigit() else None,
+                domain=company_data.get("domain"),
             )
             session.add(company_obj)
             session.commit()
             session.refresh(company_obj)
-
         seen = set()
         for e in employees:
             full_name = (e.get("full_name") or "").strip()
@@ -157,17 +148,21 @@ def upsert_company_and_employees(data: Dict[str, Any]) -> Company:
                 continue
             seen.add(key)
 
-            stmt = select(Employee).where((Employee.company_id == company_obj.id) & (func.lower(Employee.full_name) == full_name.lower()))
+            stmt = select(Employee).where(
+                (Employee.company_id == company_obj.id) & 
+                (func.lower(Employee.full_name) == full_name.lower())
+            )
             existing_emp = session.exec(stmt).first()
             if existing_emp:
-                if e.get("title") and (existing_emp.title in (None, "Not found")): 
-                    existing_emp.title = e.get("title")
-                if e.get("department") and (existing_emp.department in (None, "Not found")): 
-                    existing_emp.department = e.get("department")
-                if e.get("seniority") and (existing_emp.seniority in (None, "Not found")): 
-                    existing_emp.seniority = e.get("seniority")
-                if e.get("profile_url") and (existing_emp.profile_url in (None, "Not found")): 
-                    existing_emp.profile_url = e.get("profile_url")
+                # Only update if missing
+                if e.get("title") and existing_emp.title in (None, "Not found"): 
+                    existing_emp.title = e["title"]
+                if e.get("department") and existing_emp.department in (None, "Not found"): 
+                    existing_emp.department = e["department"]
+                if e.get("seniority") and existing_emp.seniority in (None, "Not found"): 
+                    existing_emp.seniority = e["seniority"]
+                if e.get("profile_url") and existing_emp.profile_url in (None, "Not found"): 
+                    existing_emp.profile_url = e["profile_url"]
                 session.add(existing_emp)
             else:
                 new_emp = Employee(
@@ -176,34 +171,30 @@ def upsert_company_and_employees(data: Dict[str, Any]) -> Company:
                     department=e.get("department") or "Not found",
                     seniority=e.get("seniority") or "Not found",
                     profile_url=e.get("profile_url") or "Not found",
-                    company_id=company_obj.id
+                    company_id=company_obj.id,
                 )
                 session.add(new_emp)
         session.commit()
         session.refresh(company_obj)
         return company_obj
 
-# Streamlit App 
 st.set_page_config(page_title="Company Research", layout="wide")
 st.title("🔎 Company Research Tool")
 
 with st.form("company_form"):
     q = st.text_input("Enter company name", "")
-    industry_in = st.text_input("Industry (optional)", "")
-    emp_in = st.text_input("Employee Size (optional)", "")
-    domain_in = st.text_input("Domain/Website (optional)", "")
-    submitted = st.form_submit_button("Search")
-
-if submitted and q:
-    user_inputs = {"industry": industry_in, "employee_size": emp_in, "domain": domain_in}
+    user_industry = st.text_input("Industry (optional)", "")
+    user_employee_size = st.text_input("Employee size (optional)", "")
+    user_domain = st.text_input("Domain/Website (optional)", "")
+    st.form_submit_button("Search", type="primary")
+if q:
     with Session(engine) as session:
         company = get_company_by_name(session, q)
-
     if company:
-        st.success("✅ Found in local database (Gemini NOT called)")
+        st.success("✅ Found in Neon DB")
     else:
         if not client:
-            st.error("❌ Not in DB and GEMINI_API_KEY not configured")
+            st.error("Not in DB and GEMINI_API_KEY not configured")
             st.stop()
         st.info("🌐 Fetching from Gemini...")
         try:
@@ -212,13 +203,22 @@ if submitted and q:
         except Exception as e:
             st.error(f"Error fetching/saving: {e}")
             st.stop()
-
     st.subheader("🏢 Company Information")
-    st.write(f"**Name:** {company.name}")
-    st.write(f"**Industry:** {company.industry or 'Not found'}")
-    st.write(f"**Employee size:** {company.employee_size or 'Not found'}")
-    st.write(f"**Domain:** {company.domain or 'Not found'}")
-
+    def compare_field(label, user_val, db_val):
+        """Compare user vs DB/Gemini field."""
+        if user_val and str(user_val).strip():
+            if str(user_val).strip().lower() != str(db_val or "").strip().lower():
+                st.write(
+                    f"**{label}:** ❌ Mismatch → You entered: `{user_val}` | Best Result: `{db_val or 'Not found'}`"
+                )
+            else:
+                st.write(f"**{label}:** ✅ {db_val}")
+        else:
+            st.write(f"**{label}:** {db_val or 'Not found'}")
+    compare_field("Name", q, company.name)
+    compare_field("Industry", user_industry, company.industry)
+    compare_field("Employee size", user_employee_size, company.employee_size)
+    compare_field("Domain", user_domain, company.domain)
     with Session(engine) as session:
         employees = session.exec(select(Employee).where(Employee.company_id == company.id)).all()
     st.subheader("👥 Employees")
@@ -232,6 +232,7 @@ if submitted and q:
         } for e in employees])
     else:
         st.info("No employees stored for this company.")
+
 
 
 
