@@ -26,23 +26,22 @@ def normalize_name(s: str) -> str:
 def has_name_normalized_field() -> bool:
     return hasattr(Company, "name_normalized")
 
-def get_company_by_name(session: Session, name: str) -> Optional[Company]:
-    if not name:
+def get_company_by_name(session: Session, raw_user_input: str) -> Optional[Company]:
+    if not raw_user_input:
         return None
-    # Exact match
-    res = session.exec(select(Company).where(Company.name == name)).first()
-    if res:
-        return res
-    # Normalized
+    norm = raw_user_input.strip().lower()
     if has_name_normalized_field():
-        norm = normalize_name(name)
         res = session.exec(
             select(Company).where(Company.name_normalized == norm)
         ).first()
         if res:
             return res
+    res = session.exec(select(Company).where(Company.name == raw_user_input)).first()
+    if res:
+        return res
+
     return session.exec(
-        select(Company).where(func.lower(Company.name) == name.lower())
+        select(Company).where(func.lower(Company.name) == raw_user_input.lower())
     ).first()
 
 def safe_json_parse(text: str) -> Optional[Dict[str, Any]]:
@@ -100,7 +99,7 @@ You are a factual assistant. Using Google Search grounding, return EXACTLY a JSO
         {"full_name":"string","title":"string|null","department":"string|null","seniority":"string|null","profile_url":"string|null"}
     ]
 }
-Rules: If unknown, use null. Keep employees <= 10. Consider any additional context provided to resolve ambiguity if multiple companies have the same name.
+Rules: If unknown, use null. Only list employees with confirmed association and with sufficient data (full_name; **AVOID ABBREVIATIONS**). Keep employees <= 10. Consider any additional context provided to resolve ambiguity if multiple companies have the same name.
 """
 def fetch_from_gemini(company_query: str, context: str = "") -> Dict[str, Any]:
     if not client:
@@ -126,12 +125,19 @@ def fetch_from_gemini(company_query: str, context: str = "") -> Dict[str, Any]:
         "employees": parse_employee_list_from_text(text),
     }
 
-def upsert_company_and_employees(data: Dict[str, Any]) -> Company:
+def upsert_company_and_employees(data: Dict[str, Any], raw_user_input: str = "") -> Company:
     company_data = data.get("company") or {}
     employees = data.get("employees") or []
     company_name = company_data.get("name") or "Unknown"
+    normalized_user_input = raw_user_input.strip().lower() if raw_user_input else None
+
     with Session(engine) as session:
-        existing = get_company_by_name(session, company_name)
+        existing = None
+        if normalized_user_input:
+            existing = session.exec(
+                select(Company).where(Company.name_normalized == normalized_user_input)
+            ).first()
+
         if existing:
             if company_data.get("industry"):
                 existing.industry = company_data["industry"]
@@ -142,8 +148,8 @@ def upsert_company_and_employees(data: Dict[str, Any]) -> Company:
                     pass
             if company_data.get("domain"):
                 existing.domain = company_data["domain"]
-            if has_name_normalized_field():
-                existing.name_normalized = normalize_name(company_name)
+            if has_name_normalized_field() and normalized_user_input:
+                existing.name_normalized = normalized_user_input
             session.add(existing)
             session.commit()
             session.refresh(existing)
@@ -152,8 +158,8 @@ def upsert_company_and_employees(data: Dict[str, Any]) -> Company:
             company_obj = Company(
                 name=company_name,
                 **(
-                    {"name_normalized": normalize_name(company_name)}
-                    if has_name_normalized_field()
+                    {"name_normalized": normalized_user_input}
+                    if has_name_normalized_field() and normalized_user_input
                     else {}
                 ),
                 industry=company_data.get("industry"),
@@ -174,7 +180,6 @@ def upsert_company_and_employees(data: Dict[str, Any]) -> Company:
             if key in seen:
                 continue
             seen.add(key)
-
             stmt = select(Employee).where(
                 (Employee.company_id == company_obj.id)
                 & (func.lower(Employee.full_name) == full_name.lower())
@@ -239,7 +244,7 @@ if q:
         if (needs_company_fields or not has_any_employee) and client:
             try:
                 data = fetch_from_gemini(q, user_context)
-                company = upsert_company_and_employees(data)
+                company = upsert_company_and_employees(data, q)
             except Exception as e:
                 st.warning(f"Enrichment failed: {e}")
         st.success("✅ Found in Neon DB")
@@ -250,7 +255,7 @@ if q:
         st.info("🌐 Fetching from Gemini...")
         try:
             data = fetch_from_gemini(q, user_context)
-            company = upsert_company_and_employees(data)
+            company = upsert_company_and_employees(data, q)
         except Exception as e:
             st.error(f"Error fetching/saving: {e}")
             st.stop()
@@ -292,4 +297,5 @@ if q:
         )
     else:
         st.info("No employees stored for this company.")
+
 
