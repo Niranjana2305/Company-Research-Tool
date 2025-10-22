@@ -22,7 +22,10 @@ class Employee(SQLModel, table=True):
     department: Optional[str] = Field(default=None, nullable=True)
     seniority: Optional[str] = Field(default=None, nullable=True)
     profile_url: Optional[str] = Field(default=None, nullable=True)
+    email: Optional[str] = Field(default=None, nullable=True)
     company_id: Optional[int] = Field(default=None, foreign_key="company.id")
+
+
 
 
 
