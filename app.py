@@ -132,7 +132,6 @@ def fetch_from_gemini(company_query: str, context: str = "") -> Dict[str, Any]:
         "employees": parse_employee_list_from_text(text),
     }
 
-# ------------------ 🔍 AI Agents for Email Search ------------------
 
 def generate_bulk_search_templates(company: str) -> List[str]:
     """Agent 1 – Generate Boolean search templates."""
@@ -375,4 +374,5 @@ if q:
         )
     else:
         st.info("No employees stored for this company.")
+
 
