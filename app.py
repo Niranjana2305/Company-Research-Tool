@@ -1,10 +1,12 @@
+# app.py
 import os
 import json
 import re
 from typing import Any, Dict, List, Optional
+
 from dotenv import load_dotenv
 from sqlmodel import Session, select, create_engine, SQLModel
-from sqlalchemy import func, text
+from sqlalchemy import func, text as sa_text
 from models import Company, Employee
 
 from google import genai
@@ -12,20 +14,25 @@ from google.genai import types
 import streamlit as st
 
 load_dotenv()
+
 DATABASE_URL = os.getenv("DATABASE_URL")
-engine = create_engine(DATABASE_URL, echo=False)
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL not set in .env")
+
+engine = create_engine(DATABASE_URL, echo=False, future=True)
 SQLModel.metadata.create_all(engine)
 
-# Add email column to company table if not exists
-with engine.connect() as conn:
-    conn.execute(text("ALTER TABLE company ADD COLUMN IF NOT EXISTS email VARCHAR(255);"))
-    conn.commit()
+try:
+    with engine.connect() as conn:
+        conn.execute(sa_text("ALTER TABLE company ADD COLUMN IF NOT EXISTS email VARCHAR(255);"))
+        conn.commit()
+except Exception:
+    pass
 
 client = None
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     client = genai.Client(api_key=GEMINI_API_KEY)
-
 def normalize_name(s: str) -> str:
     return " ".join(s.split()).strip().casefold() if s else ""
 
@@ -35,32 +42,69 @@ def has_name_normalized_field() -> bool:
 def get_company_by_name(session: Session, raw_user_input: str) -> Optional[Company]:
     if not raw_user_input:
         return None
-    norm = raw_user_input.strip().lower()
+
+    raw_norm = raw_user_input.strip().lower()
+
+    # If we have name_normalized, treat it as the lowercase raw user input key.
     if has_name_normalized_field():
-        res = session.exec(
-            select(Company).where(Company.name_normalized == norm)
-        ).first()
-        if res:
-            return res
-    res = session.exec(select(Company).where(Company.name == raw_user_input)).first()
-    if res:
-        return res
-    return session.exec(
-        select(Company).where(func.lower(Company.name) == raw_user_input.lower())
-    ).first()
+        company = session.exec(select(Company).where(Company.name_normalized == raw_norm)).first()
+        if company:
+            return company
+
+    # Exact name match 
+    company = session.exec(select(Company).where(Company.name == raw_user_input)).first()
+    if company:
+        return company
+
+    # Case-insensitive match on Company.name
+    return session.exec(select(Company).where(func.lower(Company.name) == raw_norm)).first()
+
+def strip_code_fences(text: str) -> str:
+    if not text:
+        return text
+    text = re.sub(r"```(?:json|js|txt)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+    return text.strip()
 
 def safe_json_parse(text: str) -> Optional[Dict[str, Any]]:
     if not text:
         return None
+
+    text = strip_code_fences(text)
+
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
     except Exception:
-        start, end = text.find("{"), text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            try:
-                return json.loads(text[start : end + 1])
-            except Exception:
-                return None
+        pass
+
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = text[start : i + 1]
+                try:
+                    parsed = json.loads(candidate)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except Exception:
+                    # try to fix common problems: trailing commas
+                    candidate_fixed = re.sub(r",\s*}", "}", candidate)
+                    candidate_fixed = re.sub(r",\s*\]", "]", candidate_fixed)
+                    try:
+                        parsed = json.loads(candidate_fixed)
+                        if isinstance(parsed, dict):
+                            return parsed
+                    except Exception:
+                        return None
     return None
 
 def parse_employee_list_from_text(text: str) -> List[Dict[str, Any]]:
@@ -69,7 +113,7 @@ def parse_employee_list_from_text(text: str) -> List[Dict[str, Any]]:
         line = line.strip()
         if not line:
             continue
-        parts = re.split(r"\s*\|\s*|\s*-\s*|\s*,\s*", line)
+        parts = re.split(r"\s*\|\s*|\s*-\s*|\s*;\s*|\t|\s{2,}", line)
         emp = {
             "full_name": None,
             "title": None,
@@ -87,109 +131,88 @@ def parse_employee_list_from_text(text: str) -> List[Dict[str, Any]]:
         if len(parts) >= 4:
             emp["seniority"] = parts[3].strip()
         if len(parts) >= 5:
-            emp["profile_url"] = parts[4].strip()
+            # sometimes URL or email
+            maybe = parts[4].strip()
+            if "@" in maybe:
+                emp["email"] = maybe
+            else:
+                emp["profile_url"] = maybe
+        if not emp["email"]:
+            m = re.search(r"([a-zA-Z0-9.\-_+]+@[a-zA-Z0-9\-_]+\.[a-zA-Z0-9.\-_]+)", line)
+            if m:
+                emp["email"] = m.group(1)
         if emp["full_name"]:
             employees.append(emp)
     return employees
 
 GEMINI_PROMPT_COMPANY = """
-You are a factual assistant. Using Google Search grounding, return EXACTLY a JSON object:
+You are a factual assistant. Using Google Search grounding, return a JSON object only (no commentary):
+
 {
-    "company": {
-        "name": "string",
-        "industry": "string|null",
-        "employee_size": "integer|null",
-        "domain": "string|null"
-    },
-    "employees": [
-        {"full_name":"string","title":"string|null","department":"string|null","seniority":"string|null","profile_url":"string|null"}
-    ]
+  "company": {
+    "name": "string or null",
+    "industry": "string or null",
+    "employee_size": "integer or null",
+    "domain": "string or null",
+    "email": "string or null"
+  },
+  "employees": [
+    {
+      "full_name":"string",
+      "title":"string or null",
+      "department":"string or null",
+      "seniority":"string or null",
+      "profile_url":"string or null",
+      "email":"string or null"
+    }
+  ]
 }
-Rules: If unknown, use null. Only list employees with confirmed association and with sufficient data (full_name; **AVOID ABBREVIATIONS**). Keep employees <= 10. Consider any additional context provided to resolve ambiguity if multiple companies have the same name.
+
+If you don't know a field, use null. Keep employees <= 10.
+Consider any additional context provided to disambiguate companies with the same name.
 """
 
 def fetch_from_gemini(company_query: str, context: str = "") -> Dict[str, Any]:
     if not client:
         raise RuntimeError("GEMINI_API_KEY not set so can't call Gemini.")
+
     tool = types.Tool(google_search=types.GoogleSearch())
     cfg = types.GenerateContentConfig(tools=[tool])
-    resp = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=GEMINI_PROMPT_COMPANY + f'\nQuery: "{company_query}"',
-        config=cfg,
-    )
-    text = getattr(resp, "text", str(resp))
+
+    query_text = f'Query: "{company_query}"'
+    if context and context.strip():
+        query_text += f'\nContext: "{context.strip()}"'
+
+    contents = GEMINI_PROMPT_COMPANY + "\n" + query_text
+    resp = client.models.generate_content(model="gemini-2.5-flash", contents=contents, config=cfg)
+
+    text = getattr(resp, "text", None) or str(resp)
     parsed = safe_json_parse(text)
     if parsed:
         return parsed
+    fallback_employees = parse_employee_list_from_text(text)
     return {
-        "company": {
-            "name": company_query,
-            "industry": None,
-            "employee_size": None,
-            "domain": None,
-        },
-        "employees": parse_employee_list_from_text(text),
+        "company": {"name": company_query, "industry": None, "employee_size": None, "domain": None, "email": None},
+        "employees": fallback_employees,
     }
-
-
-def generate_bulk_search_templates(company: str) -> List[str]:
-    """Agent 1 – Generate Boolean search templates."""
-    if not client:
-        return []
-    prompt = f"""
-    Generate 3 Boolean search queries to find employee email addresses at '{company}'.
-    Focus on sources like LinkedIn, company websites, or verified email directories.
-    Return JSON: {{"search_templates": ["query1", "query2", "query3"]}}
-    """
-    resp = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(),
-    )
-    parsed = safe_json_parse(resp.text)
-    return parsed.get("search_templates", []) if parsed else []
-
-def fetch_bulk_emails(company: str, templates: List[str]) -> Dict[str, Any]:
-    """Agent 2 – Use Gemini search grounding to find employee emails."""
-    if not client:
-        return {"company": {"name": company}, "employees": []}
-    tool = types.Tool(google_search=types.GoogleSearch())
-    cfg = types.GenerateContentConfig(tools=[tool])
-    joined_templates = "\n".join(templates)
-    prompt = f"""
-    Using the following Google search queries:
-    {joined_templates}
-
-    Find verified employee names, titles, departments, and email addresses for employees of '{company}'.
-    Only include employees with confirmed company affiliation and email patterns (e.g., @domain.com).
-    Return JSON strictly in this format:
-    {{
-      "company": {{"name": "{company}", "domain": "string|null", "industry": "string|null", "employee_size": "integer|null"}},
-      "employees": [
-        {{ "{{" }}"full_name":"string","title":"string|null","department":"string|null","email":"string|null","profile_url":"string|null"{{ "}}" }}]
-    }}
-    """
-    resp = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=cfg,
-    )
-    parsed = safe_json_parse(resp.text)
-    return parsed or {"company": {"name": company}, "employees": []}
 
 def upsert_company_and_employees(data: Dict[str, Any], raw_user_input: str = "") -> Company:
     company_data = data.get("company") or {}
     employees = data.get("employees") or []
-    company_name = company_data.get("name") or "Unknown"
+    company_name = company_data.get("name") or raw_user_input or "Unknown"
+
     normalized_user_input = raw_user_input.strip().lower() if raw_user_input else None
 
     with Session(engine) as session:
         existing = None
-        if normalized_user_input:
-            existing = session.exec(
-                select(Company).where(Company.name_normalized == normalized_user_input)
-            ).first()
+        if normalized_user_input and has_name_normalized_field():
+            existing = session.exec(select(Company).where(Company.name_normalized == normalized_user_input)).first()
+
+        if not existing and company_data.get("name"):
+            existing = session.exec(select(Company).where(Company.name == company_data["name"])).first()
+
+        if not existing:
+            existing = session.exec(select(Company).where(func.lower(Company.name) == (company_name or "").lower())).first()
 
         if existing:
             if company_data.get("industry"):
@@ -212,18 +235,17 @@ def upsert_company_and_employees(data: Dict[str, Any], raw_user_input: str = "")
         else:
             company_obj = Company(
                 name=company_name,
-                **(
-                    {"name_normalized": normalized_user_input}
-                    if has_name_normalized_field() and normalized_user_input
-                    else {}
-                ),
+                **({"name_normalized": normalized_user_input} if has_name_normalized_field() and normalized_user_input else {}),
                 industry=company_data.get("industry"),
-                employee_size=int(company_data["employee_size"])
-                if str(company_data.get("employee_size") or "").isdigit()
-                else None,
+                employee_size=int(company_data["employee_size"]) if str(company_data.get("employee_size") or "").isdigit() else None,
                 domain=company_data.get("domain"),
-                email=company_data.get("email"),
             )
+            if company_data.get("email"):
+                try:
+                    setattr(company_obj, "email", company_data.get("email"))
+                except Exception:
+                    pass
+
             session.add(company_obj)
             session.commit()
             session.refresh(company_obj)
@@ -239,70 +261,89 @@ def upsert_company_and_employees(data: Dict[str, Any], raw_user_input: str = "")
             seen.add(key)
 
             stmt = select(Employee).where(
-                (Employee.company_id == company_obj.id)
-                & (func.lower(Employee.full_name) == full_name.lower())
+                (Employee.company_id == company_obj.id) & (func.lower(Employee.full_name) == full_name.lower())
             )
             existing_emp = session.exec(stmt).first()
             if existing_emp:
                 if e.get("title") and existing_emp.title in (None, "Not found"):
-                    existing_emp.title = e["title"]
+                    existing_emp.title = e.get("title")
                 if e.get("department") and existing_emp.department in (None, "Not found"):
-                    existing_emp.department = e["department"]
+                    existing_emp.department = e.get("department")
                 if e.get("seniority") and existing_emp.seniority in (None, "Not found"):
-                    existing_emp.seniority = e["seniority"]
+                    existing_emp.seniority = e.get("seniority")
                 if e.get("profile_url") and existing_emp.profile_url in (None, "Not found"):
-                    existing_emp.profile_url = e["profile_url"]
-                if e.get("email") and existing_emp.email in (None, "Not found"):
-                    existing_emp.email = e["email"]
+                    existing_emp.profile_url = e.get("profile_url")
+                if e.get("email") and getattr(existing_emp, "email", None) in (None, "Not found"):
+                    try:
+                        existing_emp.email = e.get("email")
+                    except Exception:
+                        pass
                 session.add(existing_emp)
             else:
-                new_emp = Employee(
-                    full_name=full_name,
-                    title=e.get("title") or "Not found",
-                    department=e.get("department") or "Not found",
-                    seniority=e.get("seniority") or "Not found",
-                    profile_url=e.get("profile_url") or "Not found",
-                    email=e.get("email") or "Not found",
-                    company_id=company_obj.id,
-                )
+                new_emp_kwargs = {
+                    "full_name": full_name,
+                    "title": e.get("title") or "Not found",
+                    "department": e.get("department") or "Not found",
+                    "seniority": e.get("seniority") or "Not found",
+                    "profile_url": e.get("profile_url") or "Not found",
+                    "company_id": company_obj.id,
+                }
+                if e.get("email"):
+                    new_emp_kwargs["email"] = e.get("email")
+                new_emp = Employee(**new_emp_kwargs)
                 session.add(new_emp)
         session.commit()
         session.refresh(company_obj)
         return company_obj
 
 
+def generate_bulk_search_templates(company: str) -> List[str]:
+    if not client:
+        return []
+    prompt = f'Generate 3 concise Google search queries to find verified employee emails for "{company}". Return JSON: {{"search_templates":["q1","q2","q3"]}}'
+    resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt, config=types.GenerateContentConfig())
+    parsed = safe_json_parse(getattr(resp, "text", str(resp)))
+    return parsed.get("search_templates", []) if parsed else []
+
+def fetch_bulk_emails(company: str, templates: List[str]) -> Dict[str, Any]:
+    if not client:
+        return {"company": {"name": company}, "employees": []}
+    tool = types.Tool(google_search=types.GoogleSearch())
+    cfg = types.GenerateContentConfig(tools=[tool])
+
+    joined = "\n".join(templates)
+    prompt = f"""
+Using these queries:
+{joined}
+Find verified employees and their emails for '{company}'. Return JSON:
+{{"company":{{"name":"{company}","domain":"string|null","industry":"string|null","employee_size":"integer|null"}}, "employees":[{{"full_name":"string","title":"string|null","department":"string|null","email":"string|null","profile_url":"string|null"}}]}}
+
+    resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt, config=cfg)
+    parsed = safe_json_parse(getattr(resp, "text", str(resp)))
+    return parsed or {"company": {"name": company}, "employees": []}
+
 st.set_page_config(page_title="Company Research", layout="wide")
 st.title("🔎 Company Research Tool")
 
 with st.form("company_form"):
     q = st.text_input("Enter company name", "")
-    user_context = st.text_area(
-        "Additional context (optional)",
-        placeholder="e.g., Electric vehicles company, not the social media platform",
-    )
+    user_context = st.text_area("Additional context (optional)", placeholder="e.g., Electric vehicles company in California")
     st.form_submit_button("Search", type="primary")
 
 if q:
     with Session(engine) as session:
         company = get_company_by_name(session, q)
+
     if company:
-        needs_company_fields = (
-            not company.industry
-            or not company.domain
-            or (company.employee_size in (None, ""))
-        )
-        has_any_employee = False
+        needs_company_fields = not company.industry or not company.domain or (company.employee_size in (None, ""))
         with Session(engine) as session:
-            has_any_employee = (
-                session.exec(
-                    select(Employee.id).where(Employee.company_id == company.id)
-                ).first()
-                is not None
-            )
+            has_any_employee = session.exec(select(Employee.id).where(Employee.company_id == company.id)).first() is not None
+
         if (needs_company_fields or not has_any_employee) and client:
+            st.info("🔄 Enriching from Gemini…")
             try:
                 data = fetch_from_gemini(q, user_context)
-                company = upsert_company_and_employees(data, q)
+                company = upsert_company_and_employees(data, raw_user_input=q)
             except Exception as e:
                 st.warning(f"Enrichment failed: {e}")
         st.success("✅ Found in Neon DB")
@@ -313,28 +354,24 @@ if q:
         st.info("🌐 Fetching from Gemini...")
         try:
             data = fetch_from_gemini(q, user_context)
-            company = upsert_company_and_employees(data, q)
+            company = upsert_company_and_employees(data, raw_user_input=q)
         except Exception as e:
             st.error(f"Error fetching/saving: {e}")
             st.stop()
 
-    # Automatic email enrichment (Option B)
     with Session(engine) as session:
-        employees = session.exec(
-            select(Employee).where(Employee.company_id == company.id)
-        ).all()
+        employees = session.exec(select(Employee).where(Employee.company_id == company.id)).all()
 
-    if not employees or any(e.email in (None, "Not found") for e in employees):
-        st.info("🔍 Fetching verified employee emails...")
+    if (not employees or len(employees) == 0) and client:
+        st.info("🔍 Attempting to find employees & emails...")
         try:
             templates = generate_bulk_search_templates(q)
-            data = fetch_bulk_emails(q, templates)
-            company = upsert_company_and_employees(data, q)
-            st.success("✅ Employee emails enriched successfully!")
-            with Session(engine) as session:
-                employees = session.exec(
-                    select(Employee).where(Employee.company_id == company.id)
-                ).all()
+            if templates:
+                data = fetch_bulk_emails(q, templates)
+                company = upsert_company_and_employees(data, raw_user_input=q)
+                with Session(engine) as session:
+                    employees = session.exec(select(Employee).where(Employee.company_id == company.id)).all()
+                st.success("✅ Employee enrichment attempt finished")
         except Exception as e:
             st.warning(f"Email enrichment failed: {e}")
 
@@ -343,9 +380,7 @@ if q:
     def compare_field(label, user_val, db_val):
         if user_val and str(user_val).strip():
             if str(user_val).strip().lower() != str(db_val or "").strip().lower():
-                st.write(
-                    f"**{label}:** ❌ Mismatch| You entered: `{user_val}` | Best Result: `{db_val or 'Not found'}`"
-                )
+                st.write(f"**{label}:** ❌ Mismatch | You entered: `{user_val}` | Best Result: `{db_val or 'Not found'}`")
             else:
                 st.write(f"**{label}:** {db_val}")
         else:
@@ -355,24 +390,20 @@ if q:
     st.write(f"**Industry:** {company.industry or 'Not found'}")
     st.write(f"**Employee size:** {company.employee_size or 'Not found'}")
     st.write(f"**Domain:** {company.domain or 'Not found'}")
-    st.write(f"**Email:** {company.email or 'Not found'}")
+    st.write(f"**Email:** {getattr(company, 'email', None) or 'Not found'}")
 
     st.subheader("👥 Employees")
     if employees:
-        st.table(
-            [
-                {
-                    "Name": e.full_name,
-                    "Title": e.title,
-                    "Department": e.department,
-                    "Seniority": e.seniority,
-                    "Email": e.email or "Not found",
-                    "Profile": e.profile_url,
-                }
-                for e in employees
-            ]
-        )
+        rows = []
+        for e in employees:
+            rows.append({
+                "Name": e.full_name,
+                "Title": e.title,
+                "Department": e.department,
+                "Seniority": e.seniority,
+                "Email": getattr(e, "email", None) or "Not found",
+                "Profile": e.profile_url or "Not found"
+            })
+        st.table(rows)
     else:
         st.info("No employees stored for this company.")
-
-
