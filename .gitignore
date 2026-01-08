@@ -1,1 +1,46 @@
-.env.txt
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+venv
+
+# Environment variables (SENSITIVE - never commit)
+.env
+.env.local
+.env.*.local
+.env.staging
+!.env.example
+!.env.staging.example
+
+# Logs
+*.log
+_logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test/Coverage
+.coverage
+.pytest_cache/
+htmlcov/
+
+# Build artifacts
+*.so
+*.dylib
+
+# Database
+*.db 
+*.sqlite3
