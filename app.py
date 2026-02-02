@@ -1,5 +1,3 @@
-# app.py
-"""Company Research Tool - AI-powered company and employee lookup using Gemini."""
 
 import json
 import logging
