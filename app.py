@@ -318,9 +318,9 @@ Using these queries:
 Find verified employees and their emails for '{company}'. Return JSON:
 {{"company":{{"name":"{company}","domain":"string|null","industry":"string|null","employee_size":"integer|null"}}, "employees":[{{"full_name":"string","title":"string|null","department":"string|null","email":"string|null","profile_url":"string|null"}}]}}
 
-    resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt, config=cfg)
-    parsed = safe_json_parse(getattr(resp, "text", str(resp)))
-    return parsed or {"company": {"name": company}, "employees": []}
+resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt, config=cfg)
+parsed = safe_json_parse(getattr(resp, "text", str(resp)))
+return parsed or {"company": {"name": company}, "employees": []}
 
 st.set_page_config(page_title="Company Research", layout="wide")
 st.title("🔎 Company Research Tool")
@@ -407,3 +407,4 @@ if q:
         st.table(rows)
     else:
         st.info("No employees stored for this company.")
+
