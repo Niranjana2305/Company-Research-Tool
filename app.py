@@ -10,12 +10,9 @@ from google import genai
 from google.genai import types
 import streamlit as st
 
-# Import your models explicitly
 from models import Company, Employee
 
-# -------------------------------------------------------------------
-# 1. Setup & Environment
-# -------------------------------------------------------------------
+#Setup & Environment
 load_dotenv()
 st.set_page_config(page_title="Company Research", layout="wide")
 st.title("🏢 Company Research Tool")
@@ -23,7 +20,6 @@ st.title("🏢 Company Research Tool")
 @st.cache_resource
 def get_engine():
     db_url = os.getenv("DATABASE_URL") or "sqlite:///company_research.db"
-    # Ensure driver compatibility for Render/Neon
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql+psycopg2://", 1)
     elif db_url.startswith("postgresql://") and "+psycopg2" not in db_url:
@@ -190,3 +186,4 @@ if submitted and q:
 
         except Exception as e:
             st.error(f"An error occurred: {e}")
+
